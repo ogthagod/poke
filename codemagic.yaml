@@ -1,0 +1,40 @@
+workflows:
+  ios-build:
+    name: iOS Unsigned Build
+    max_build_duration: 30
+    instance_type: mac_mini_m1
+    environment:
+      vars:
+        XCODE_PROJECT: "GoPlusEmulator.xcodeproj"
+        XCODE_SCHEME: "GoPlusEmulator"
+    triggering:
+      events:
+        - push
+        - tag
+        - pull_request
+      cancel_previous_builds_on_new_commit: true
+    scripts:
+      - name: Install XcodeGen
+        script: |
+          brew install xcodegen
+      - name: Generate Xcode Project
+        script: |
+          xcodegen generate
+      - name: Build Xcode Project (Unsigned)
+        script: |
+          xcodebuild -project "$XCODE_PROJECT" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE_SPECIFIER=""
+      - name: Package Application into IPA
+        script: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/GoPlusEmulator.app Payload/
+          zip -r GoPlusEmulator.ipa Payload
+    artifacts:
+      - GoPlusEmulator.ipa

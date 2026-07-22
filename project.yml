@@ -1,0 +1,17 @@
+name: GoPlusEmulator
+options:
+  bundleIdPrefix: com.lo.goplus
+targets:
+  GoPlusEmulator:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - GoPlusEmulatorApp.swift
+      - ContentView.swift
+    info:
+      path: Info.plist
+      properties:
+        NSBluetoothAlwaysUsageDescription: "We need Bluetooth permission to emulate the Go Plus peripheral accessory."
+        NSBluetoothPeripheralUsageDescription: "We need Bluetooth permission to emulate the Go Plus peripheral accessory."
+        UIBackgroundModes: [bluetooth-peripheral]
