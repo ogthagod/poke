@@ -12,7 +12,6 @@ workflows:
         - push
         - tag
         - pull_request
-      cancel_previous_builds_on_new_commit: true
     scripts:
       - name: Install XcodeGen
         script: |
