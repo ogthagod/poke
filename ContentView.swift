@@ -54,7 +54,7 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
         DispatchQueue.main.async {
             let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
             self.logMessages.insert("[\(timestamp)] \(message)", at: 0)
-            if self.logMessages.count > 40 {
+            if self.logMessages.count > 30 {
                 self.logMessages.removeLast()
             }
         }
@@ -68,13 +68,15 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
         
         setupServices()
         
+        // The game requires the advertised BLE name to be "Pokemon GO Plus" (or "PGP") to detect it.
+        // We keep the Bluetooth broadcast name correct so the hack works, but rebrand the app UI to COMP WARE.
         let advertisementData: [String: Any] = [
             CBAdvertisementDataServiceUUIDsKey: [serviceUUID],
             CBAdvertisementDataLocalNameKey: "Pokemon GO Plus"
         ]
         
         peripheralManager.startAdvertising(advertisementData)
-        log("Started advertising...")
+        log("Started COMP WARE transmitter...")
         
         advertisingStartTime = Date()
         runTime = 0
@@ -93,13 +95,12 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
         timer?.invalidate()
         timer = nil
         
-        // Reset connection status for devices
         DispatchQueue.main.async {
             for i in 0..<self.farmDevices.count {
                 self.farmDevices[i].isConnected = false
             }
         }
-        log("Stopped advertising.")
+        log("COMP WARE transmitter stopped.")
     }
     
     private func setupServices() {
@@ -133,7 +134,7 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
     
     func pressButton() {
         guard let buttonChar = buttonCharacteristic else { return }
-        log("Virtual button pressed!")
+        log("COMP WARE: Virtual click!")
         
         let pressValue = Data([0x01, 0x00])
         peripheralManager.updateValue(pressValue, for: buttonChar, onSubscribedCentrals: nil)
@@ -141,11 +142,10 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             let releaseValue = Data([0x00, 0x00])
             self.peripheralManager.updateValue(releaseValue, for: buttonChar, onSubscribedCentrals: nil)
-            self.log("Virtual button released.")
+            self.log("COMP WARE: Click released.")
         }
     }
     
-    // Toggle a device's enabled state. If disabled, we disconnect it.
     func toggleDevice(_ deviceId: UUID) {
         if let index = farmDevices.firstIndex(where: { $0.id == deviceId }) {
             farmDevices[index].isEnabled.toggle()
@@ -154,14 +154,12 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
             let status = farmDevices[index].isEnabled ? "ENABLED" : "DISABLED"
             log("Phone '\(farmDevices[index].name)' \(status)")
             
-            // If disabled and connected, force a clean service reset to kick it off
             if !farmDevices[index].isEnabled && farmDevices[index].isConnected {
                 resetServicesToDisconnect()
             }
         }
     }
     
-    // Rename a device in the farm
     func renameDevice(_ deviceId: UUID, newName: String) {
         if let index = farmDevices.firstIndex(where: { $0.id == deviceId }) {
             farmDevices[index].name = newName
@@ -170,7 +168,6 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
         }
     }
     
-    // Delete a device from the farm
     func deleteDevice(_ deviceId: UUID) {
         farmDevices.removeAll(where: { $0.id == deviceId })
         saveDevices()
@@ -178,7 +175,6 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
         resetServicesToDisconnect()
     }
     
-    // Resetting services is the only clean way in iOS CoreBluetooth to drop active connections
     private func resetServicesToDisconnect() {
         log("Resetting services to enforce connection rules...")
         let wasAdvertising = isAdvertising
@@ -194,7 +190,6 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
     }
     
     private func parseGameCommand(_ data: Data, from central: CBCentral) {
-        // If device is disabled, ignore command
         if let device = farmDevices.firstMatch(for: central.identifier), !device.isEnabled {
             return
         }
@@ -236,7 +231,6 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
         return deviceName(for: central.identifier)
     }
     
-    // Persistence
     private func saveDevices() {
         if let encoded = try? JSONEncoder().encode(farmDevices) {
             UserDefaults.standard.set(encoded, forKey: "GoPlusFarmDevices")
@@ -254,7 +248,7 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
     
     func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
         if peripheral.state == .poweredOn {
-            log("Bluetooth Ready.")
+            log("COMP WARE Ready.")
         } else if peripheral.state == .poweredOff {
             log("Bluetooth Powered Off.")
             stopAdvertising()
@@ -267,7 +261,7 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
                 self.log("Advertising failed: \(error.localizedDescription)")
                 self.isAdvertising = false
             } else {
-                self.log("Advertising Active.")
+                self.log("COMP WARE Active.")
                 self.isAdvertising = true
                 self.connectionStatus = self.farmDevices.contains(where: { $0.isConnected }) ? "Connected" : "Advertising..."
             }
@@ -279,24 +273,20 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
             let isAlreadyKnown = self.farmDevices.contains(where: { $0.id == central.identifier })
             let connectedDevicesCount = self.farmDevices.filter({ $0.isConnected && $0.isEnabled }).count
             
-            // Rule: No new connections allowed if someone is already connected, UNLESS pairing mode is active
             if connectedDevicesCount > 0 && !self.isPairingMode && !isAlreadyKnown {
-                self.log("Connection blocked: Another phone is connected. Turn on 'Add Phone' to pair.")
+                self.log("Access blocked: Pairing locked. Use 'ADD PHONE'.")
                 self.resetServicesToDisconnect()
                 return
             }
             
-            // Add or activate device
             if let index = self.farmDevices.firstIndex(where: { $0.id == central.identifier }) {
-                // If it is disabled, reject it immediately
                 if !self.farmDevices[index].isEnabled {
-                    self.log("Connection rejected: '\(self.farmDevices[index].name)' is disabled.")
+                    self.log("Rejected connection: '\(self.farmDevices[index].name)' paused.")
                     self.resetServicesToDisconnect()
                     return
                 }
                 self.farmDevices[index].isConnected = true
             } else {
-                // New device pairing
                 if self.isPairingMode || self.farmDevices.isEmpty {
                     let newDevice = FarmDevice(
                         id: central.identifier,
@@ -306,10 +296,10 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
                     )
                     self.farmDevices.append(newDevice)
                     self.saveDevices()
-                    self.isPairingMode = false // Auto-lock pairing mode
+                    self.isPairingMode = false
                     self.log("Linked new phone: \(newDevice.name)")
                 } else {
-                    self.log("Connection rejected: Unknown phone. Click 'Add Phone' to pair.")
+                    self.log("Rejected connection: Click 'ADD PHONE' to link.")
                     self.resetServicesToDisconnect()
                     return
                 }
@@ -323,7 +313,7 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
         DispatchQueue.main.async {
             if let index = self.farmDevices.firstIndex(where: { $0.id == central.identifier }) {
                 self.farmDevices[index].isConnected = false
-                self.log("Phone '\(self.farmDevices[index].name)' disconnected.")
+                self.log("Phone '\(self.farmDevices[index].name)' offline.")
             }
             
             let anyConnected = self.farmDevices.contains(where: { $0.isConnected && $0.isEnabled })
@@ -333,7 +323,6 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
     
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
         for request in requests {
-            // Validate client authorization
             if let device = farmDevices.first(where: { $0.id == request.central.identifier }), !device.isEnabled {
                 peripheralManager.respond(to: request, withResult: .writeNotPermitted)
                 return
@@ -351,7 +340,6 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
     }
     
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
-        // Validate client authorization
         if let device = farmDevices.first(where: { $0.id == request.central.identifier }), !device.isEnabled {
             peripheralManager.respond(to: request, withResult: .readNotPermitted)
             return
@@ -396,25 +384,27 @@ struct ContentView: View {
             LinearGradient(
                 gradient: Gradient(colors: [
                     Color(red: 0.02, green: 0.02, blue: 0.04),
-                    Color(red: 0.06, green: 0.06, blue: 0.09),
-                    Color(red: 0.03, green: 0.03, blue: 0.05)
+                    Color(red: 0.05, green: 0.05, blue: 0.08),
+                    Color(red: 0.02, green: 0.02, blue: 0.04)
                 ]),
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
             .ignoresSafeArea()
             
-            ScrollView {
-                VStack(spacing: 20) {
-                    // Header Banner
+            // Scaled ScrollView to prevent overflow on all devices (iPhone SE to Pro Max)
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(spacing: 12) {
+                    
+                    // Compact Header Banner
                     HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("GO+ FARM MASTER")
-                                .font(.system(size: 22, weight: .black, design: .monospaced))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("COMP WARE")
+                                .font(.system(size: 26, weight: .black, design: .monospaced))
                                 .foregroundColor(.white)
                                 .tracking(4)
                             
-                            Text("MULTI-PHONE EMULATION HUBS")
+                            Text("MULTI-PHONE FARM EMULATOR")
                                 .font(.system(size: 8, weight: .bold, design: .monospaced))
                                 .foregroundColor(.purple)
                         }
@@ -425,83 +415,83 @@ struct ContentView: View {
                             .frame(width: 8, height: 8)
                             .shadow(color: bleManager.isAdvertising ? .green : .red, radius: 4)
                     }
-                    .padding(.horizontal, 24)
-                    .padding(.top, 16)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 10)
                     
-                    // Connection Status Dashboard
-                    VStack(spacing: 6) {
+                    // Connected Status Dashboard
+                    VStack(spacing: 4) {
                         Text("SYSTEM STATE")
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .font(.system(size: 8, weight: .bold, design: .monospaced))
                             .foregroundColor(.gray)
                         
                         Text(bleManager.connectionStatus)
-                            .font(.system(size: 24, weight: .heavy, design: .rounded))
+                            .font(.system(size: 20, weight: .heavy, design: .rounded))
                             .foregroundColor(bleManager.connectionStatus == "Connected" ? .green : (bleManager.isAdvertising ? .cyan : .red))
                             .shadow(color: (bleManager.connectionStatus == "Connected" ? Color.green : (bleManager.isAdvertising ? Color.cyan : Color.red)).opacity(0.3), radius: 8)
                     }
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
+                    .padding(.vertical, 8)
                     .background(Color.white.opacity(0.02))
-                    .cornerRadius(16)
+                    .cornerRadius(12)
                     .overlay(
-                        RoundedRectangle(cornerRadius: 16)
+                        RoundedRectangle(cornerRadius: 12)
                             .stroke(Color.white.opacity(0.08), lineWidth: 1)
                     )
-                    .padding(.horizontal, 20)
+                    .padding(.horizontal, 16)
                     
                     // Stats Widgets Row
-                    HStack(spacing: 10) {
-                        VStack(spacing: 6) {
+                    HStack(spacing: 8) {
+                        VStack(spacing: 4) {
                             Image(systemName: "timer")
-                                .font(.system(size: 14))
+                                .font(.system(size: 12))
                                 .foregroundColor(.cyan)
                             Text("UPTIME")
                                 .font(.system(size: 8, weight: .bold, design: .monospaced))
                                 .foregroundColor(.gray)
                             Text(formattedTime)
-                                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
                                 .foregroundColor(.white)
                         }
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
+                        .padding(.vertical, 8)
                         .background(Color.white.opacity(0.03))
                         .cornerRadius(10)
                         
-                        VStack(spacing: 6) {
+                        VStack(spacing: 4) {
                             Image(systemName: "mappin.circle.fill")
-                                .font(.system(size: 14))
+                                .font(.system(size: 12))
                                 .foregroundColor(.purple)
                             Text("SPUN")
                                 .font(.system(size: 8, weight: .bold, design: .monospaced))
                                 .foregroundColor(.gray)
                             Text("\(bleManager.pokestopsSpun)")
-                                .font(.system(size: 15, weight: .bold))
+                                .font(.system(size: 13, weight: .bold))
                                 .foregroundColor(.purple)
                         }
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
+                        .padding(.vertical, 8)
                         .background(Color.white.opacity(0.03))
                         .cornerRadius(10)
                         
-                        VStack(spacing: 6) {
+                        VStack(spacing: 4) {
                             Image(systemName: "bolt.circle.fill")
-                                .font(.system(size: 14))
+                                .font(.system(size: 12))
                                 .foregroundColor(.green)
                             Text("CAUGHT")
                                 .font(.system(size: 8, weight: .bold, design: .monospaced))
                                 .foregroundColor(.gray)
                             Text("\(bleManager.pokemonCaught)")
-                                .font(.system(size: 15, weight: .bold))
+                                .font(.system(size: 13, weight: .bold))
                                 .foregroundColor(.green)
                         }
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
+                        .padding(.vertical, 8)
                         .background(Color.white.opacity(0.03))
                         .cornerRadius(10)
                     }
-                    .padding(.horizontal, 20)
+                    .padding(.horizontal, 16)
                     
-                    // Central Active Controller Ring
+                    // Compact Active Controller Ring
                     Button(action: {
                         if bleManager.connectionStatus == "Connected" {
                             bleManager.pressButton()
@@ -509,93 +499,92 @@ struct ContentView: View {
                     }) {
                         ZStack {
                             Circle()
-                                .fill(LinearGradient(gradient: Gradient(colors: [Color.cyan.opacity(0.15), Color.purple.opacity(0.15)]), startPoint: .top, endPoint: .bottom))
-                                .frame(width: 170, height: 170)
-                                .blur(radius: bleManager.connectionStatus == "Connected" ? 25 : 5)
+                                .fill(LinearGradient(gradient: Gradient(colors: [Color.cyan.opacity(0.12), Color.purple.opacity(0.12)]), startPoint: .top, endPoint: .bottom))
+                                .frame(width: 140, height: 140)
+                                .blur(radius: bleManager.connectionStatus == "Connected" ? 15 : 2)
                             
                             Circle()
                                 .fill(LinearGradient(gradient: Gradient(colors: [Color.purple, Color.cyan]), startPoint: .topLeading, endPoint: .bottomTrailing))
-                                .frame(width: 140, height: 140)
-                                .shadow(color: .cyan.opacity(0.3), radius: 10)
+                                .frame(width: 110, height: 110)
+                                .shadow(color: .cyan.opacity(0.3), radius: 8)
                             
                             Circle()
                                 .fill(Color(red: 0.04, green: 0.04, blue: 0.06))
-                                .frame(width: 126, height: 126)
+                                .frame(width: 98, height: 98)
                             
                             Circle()
                                 .fill(bleManager.connectionStatus == "Connected" ? Color.green : Color.red)
-                                .frame(width: 44, height: 44)
-                                .shadow(color: (bleManager.connectionStatus == "Connected" ? Color.green : Color.red).opacity(0.8), radius: 10)
+                                .frame(width: 32, height: 32)
+                                .shadow(color: (bleManager.connectionStatus == "Connected" ? Color.green : Color.red).opacity(0.8), radius: 8)
                             
-                            Text("ACTION BUTTON")
+                            Text("CLICK")
                                 .font(.system(size: 8, weight: .bold, design: .monospaced))
                                 .foregroundColor(.white)
-                                .offset(y: -34)
+                                .offset(y: -26)
                                 .opacity(bleManager.connectionStatus == "Connected" ? 1.0 : 0.3)
                         }
                     }
                     .disabled(bleManager.connectionStatus != "Connected")
                     .buttonStyle(PlainButtonStyle())
+                    .padding(.vertical, 4)
                     
                     // Farm Device Manager Section
-                    VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 8) {
                         HStack {
-                            Text("PHONE FARM LIST")
-                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            Text("FARM DEVICE POOL")
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
                                 .foregroundColor(.cyan)
                             
                             Spacer()
                             
-                            // "Add Phone" pairing mode button
                             Button(action: {
                                 bleManager.isPairingMode.toggle()
                                 bleManager.log("Pairing mode (Add Phone) set to: \(bleManager.isPairingMode)")
                             }) {
-                                HStack(spacing: 4) {
+                                HStack(spacing: 3) {
                                     Image(systemName: bleManager.isPairingMode ? "antenna.radiowaves.left.and.right" : "plus.circle.fill")
-                                    Text(bleManager.isPairingMode ? "WAITING..." : "ADD PHONE")
+                                    Text(bleManager.isPairingMode ? "LOCKING..." : "ADD PHONE")
                                 }
-                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .font(.system(size: 8, weight: .bold, design: .monospaced))
                                 .foregroundColor(.black)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 6)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
                                 .background(bleManager.isPairingMode ? Color.yellow : Color.cyan)
-                                .cornerRadius(12)
+                                .cornerRadius(10)
                             }
                         }
-                        .padding(.horizontal, 4)
                         
                         if bleManager.farmDevices.isEmpty {
-                            Text("No phones linked yet. Boot the emulator and connect a phone, or toggle 'Add Phone' to pair.")
-                                .font(.system(size: 10, design: .rounded))
+                            Text("No phones linked. Enable transmitter and connect a device, or click 'ADD PHONE' to pair.")
+                                .font(.system(size: 9, design: .rounded))
                                 .foregroundColor(.gray)
+                                .multilineTextAlignment(.center)
                                 .frame(maxWidth: .infinity, alignment: .center)
                                 .padding()
                                 .background(Color.white.opacity(0.01))
-                                .cornerRadius(12)
+                                .cornerRadius(10)
                         } else {
-                            VStack(spacing: 8) {
+                            VStack(spacing: 6) {
                                 ForEach(bleManager.farmDevices) { device in
-                                    HStack(spacing: 12) {
-                                        // Edit Device Name / Normal Label
+                                    HStack(spacing: 8) {
                                         if editingDeviceId == device.id {
                                             TextField("Name", text: $editingDeviceName, onCommit: {
                                                 bleManager.renameDevice(device.id, newName: editingDeviceName)
                                                 editingDeviceId = nil
                                             })
                                             .textFieldStyle(PlainTextFieldStyle())
-                                            .font(.system(size: 13, weight: .bold))
+                                            .font(.system(size: 12, weight: .bold))
                                             .foregroundColor(.white)
-                                            .padding(6)
+                                            .padding(4)
                                             .background(Color.white.opacity(0.08))
-                                            .cornerRadius(6)
+                                            .cornerRadius(4)
                                         } else {
-                                            VStack(alignment: .leading, spacing: 2) {
+                                            VStack(alignment: .leading, spacing: 1) {
                                                 Text(device.name)
-                                                    .font(.system(size: 13, weight: .bold))
+                                                    .font(.system(size: 12, weight: .bold))
                                                     .foregroundColor(device.isEnabled ? .white : .gray)
                                                 Text(device.isConnected ? "CONNECTED" : "LINK STANDBY")
-                                                    .font(.system(size: 8, weight: .bold, design: .monospaced))
+                                                    .font(.system(size: 7, weight: .bold, design: .monospaced))
                                                     .foregroundColor(device.isConnected ? .green : .gray)
                                             }
                                             
@@ -604,48 +593,46 @@ struct ContentView: View {
                                                 editingDeviceName = device.name
                                             }) {
                                                 Image(systemName: "pencil")
-                                                    .font(.system(size: 10))
+                                                    .font(.system(size: 9))
                                                     .foregroundColor(.gray)
                                             }
                                         }
                                         
                                         Spacer()
                                         
-                                        // Toggle active device emulation state
                                         Button(action: {
                                             bleManager.toggleDevice(device.id)
                                         }) {
                                             Text(device.isEnabled ? "ACTIVE" : "PAUSED")
-                                                .font(.system(size: 9, weight: .black, design: .monospaced))
+                                                .font(.system(size: 8, weight: .black, design: .monospaced))
                                                 .foregroundColor(device.isEnabled ? .black : .white)
-                                                .padding(.horizontal, 10)
-                                                .padding(.vertical, 4)
+                                                .padding(.horizontal, 8)
+                                                .padding(.vertical, 3)
                                                 .background(device.isEnabled ? Color.green : Color.white.opacity(0.1))
-                                                .cornerRadius(8)
+                                                .cornerRadius(6)
                                         }
                                         
-                                        // Delete/Remove Device Button
                                         Button(action: {
                                             bleManager.deleteDevice(device.id)
                                         }) {
                                             Image(systemName: "trash")
-                                                .font(.system(size: 12))
+                                                .font(.system(size: 10))
                                                 .foregroundColor(.red.opacity(0.8))
                                         }
                                     }
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
                                     .background(Color.white.opacity(0.02))
-                                    .cornerRadius(10)
+                                    .cornerRadius(8)
                                     .overlay(
-                                        RoundedRectangle(cornerRadius: 10)
-                                            .stroke(device.isConnected ? Color.green.opacity(0.3) : Color.white.opacity(0.05), lineWidth: 1)
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .stroke(device.isConnected ? Color.green.opacity(0.3) : Color.white.opacity(0.04), lineWidth: 1)
                                     )
                                 }
                             }
                         }
                     }
-                    .padding(.horizontal, 20)
+                    .padding(.horizontal, 16)
                     
                     // Boot up button
                     Button(action: {
@@ -655,47 +642,47 @@ struct ContentView: View {
                             bleManager.startAdvertising()
                         }
                     }) {
-                        Text(bleManager.isAdvertising ? "POWER DOWN ENGINE" : "IGNITION EMULATOR")
-                            .font(.system(size: 13, weight: .black, design: .monospaced))
+                        Text(bleManager.isAdvertising ? "TERMINATE COMP WARE" : "IGNITE COMP WARE")
+                            .font(.system(size: 11, weight: .black, design: .monospaced))
                             .foregroundColor(.black)
-                            .padding(.vertical, 14)
-                            .padding(.horizontal, 36)
+                            .padding(.vertical, 12)
+                            .padding(.horizontal, 32)
                             .background(bleManager.isAdvertising ? Color.red : Color.cyan)
-                            .cornerRadius(25)
-                            .shadow(color: (bleManager.isAdvertising ? Color.red : Color.cyan).opacity(0.3), radius: 8)
+                            .cornerRadius(20)
+                            .shadow(color: (bleManager.isAdvertising ? Color.red : Color.cyan).opacity(0.3), radius: 6)
                     }
+                    .padding(.vertical, 4)
                     
-                    // Feed
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("MASTER STREAM FEED")
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    // Log Feed
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("COMP WARE SYSTEM FEED")
+                            .font(.system(size: 8, weight: .bold, design: .monospaced))
                             .foregroundColor(.purple)
                             .padding(.horizontal, 4)
                         
                         ScrollView {
-                            LazyVStack(alignment: .leading, spacing: 4) {
+                            LazyVStack(alignment: .leading, spacing: 2) {
                                 ForEach(bleManager.logMessages, id: \.self) { log in
                                     Text(log)
-                                        .font(.system(size: 8, design: .monospaced))
+                                        .font(.system(size: 7, design: .monospaced))
                                         .foregroundColor(.white.opacity(0.6))
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                             }
-                            .padding(10)
+                            .padding(8)
                         }
                         .background(Color.black.opacity(0.5))
-                        .cornerRadius(12)
-                        .frame(height: 90)
+                        .cornerRadius(10)
+                        .frame(height: 75)
                         .overlay(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color.white.opacity(0.05), lineWidth: 1)
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(Color.white.opacity(0.04), lineWidth: 1)
                         )
                     }
-                    .padding(.horizontal, 20)
+                    .padding(.horizontal, 16)
                     
-                    Spacer()
                 }
-                .padding(.vertical)
+                .padding(.vertical, 8)
             }
         }
     }
