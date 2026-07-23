@@ -7,6 +7,20 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
     @Published var logMessages: [String] = []
     @Published var lastCommandReceived = "None"
     
+    // Stats tracking
+    @Published var pokemonCaught = 0
+    @Published var pokestopsSpun = 0
+    @Published var runTime: TimeInterval = 0
+    
+    enum EncounterType {
+        case pokemon
+        case pokestop
+    }
+    
+    private var timer: Timer?
+    private var advertisingStartTime: Date?
+    private var lastEncounterType: EncounterType? = nil
+    
     private var peripheralManager: CBPeripheralManager!
     private var goPlusService: CBMutableService?
     private var ledVibrateCharacteristic: CBMutableCharacteristic?
@@ -28,7 +42,7 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
         DispatchQueue.main.async {
             let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
             self.logMessages.insert("[\(timestamp)] \(message)", at: 0)
-            if self.logMessages.count > 50 {
+            if self.logMessages.count > 40 {
                 self.logMessages.removeLast()
             }
         }
@@ -36,31 +50,41 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
     
     func startAdvertising() {
         guard peripheralManager.state == .poweredOn else {
-            log("Error: Bluetooth is powered off or unavailable.")
+            log("Error: Bluetooth is powered off.")
             return
         }
         
         setupServices()
         
-        // Advertise as "Pokemon GO Plus" with the service UUID
         let advertisementData: [String: Any] = [
             CBAdvertisementDataServiceUUIDsKey: [serviceUUID],
             CBAdvertisementDataLocalNameKey: "Pokemon GO Plus"
         ]
         
         peripheralManager.startAdvertising(advertisementData)
-        log("Started advertising as 'Pokemon GO Plus'...")
+        log("Started advertising...")
+        
+        // Start runtime tracker
+        advertisingStartTime = Date()
+        runTime = 0
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self, let start = self.advertisingStartTime else { return }
+            DispatchQueue.main.async {
+                self.runTime = Date().timeIntervalSince(start)
+            }
+        }
     }
     
     func stopAdvertising() {
         peripheralManager.stopAdvertising()
         isAdvertising = false
         connectionStatus = "Disconnected"
+        timer?.invalidate()
+        timer = nil
         log("Stopped advertising.")
     }
     
     private func setupServices() {
-        // Characteristic for LED and Vibration commands (Write/Notify)
         ledVibrateCharacteristic = CBMutableCharacteristic(
             type: ledVibrateUUID,
             properties: [.write, .notify, .writeWithoutResponse],
@@ -68,7 +92,6 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
             permissions: [.writeable]
         )
         
-        // Characteristic for button press updates (Read/Notify)
         buttonCharacteristic = CBMutableCharacteristic(
             type: buttonUUID,
             properties: [.read, .notify],
@@ -76,7 +99,6 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
             permissions: [.readable]
         )
         
-        // Characteristic for handshake authentication (Read/Write)
         certCharacteristic = CBMutableCharacteristic(
             type: certUUID,
             properties: [.read, .write],
@@ -91,21 +113,58 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
         peripheralManager.add(goPlusService!)
     }
     
-    // Send virtual button press event
     func pressButton() {
         guard let buttonChar = buttonCharacteristic else { return }
         log("Virtual button pressed!")
         
-        // When pressed, send a value notification.
-        // The standard Go Plus protocol uses specific payloads (e.g. 0x0100 for pressed, 0x0000 for released)
         let pressValue = Data([0x01, 0x00])
         peripheralManager.updateValue(pressValue, for: buttonChar, onSubscribedCentrals: nil)
         
-        // Auto release after a small delay
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             let releaseValue = Data([0x00, 0x00])
             self.peripheralManager.updateValue(releaseValue, for: buttonChar, onSubscribedCentrals: nil)
             self.log("Virtual button released.")
+        }
+    }
+    
+    // Heuristic parser for incoming game commands to track spins and catches
+    private func parseGameCommand(_ data: Data) {
+        let hexString = data.map { String(format: "%02hhx", $0) }.joined()
+        log("Incoming CMD: 0x\(hexString)")
+        
+        DispatchQueue.main.async {
+            self.lastCommandReceived = "0x\(hexString)"
+            
+            // Check for LED flashing patterns
+            // Pokémon Go Plus protocol sends patterns with distinct byte signatures:
+            // - Blue light flashing pattern typically indicates a Pokestop nearby
+            // - Green/Yellow flashing pattern indicates a Pokemon nearby
+            // - Rainbow/multi-vibration pattern indicates success (catch or spin completed)
+            if hexString.contains("020810") || hexString.contains("0000ff") || hexString.contains("030002") {
+                // Pokestop indicator (typically contains blue hex components)
+                self.lastEncounterType = .pokestop
+                self.log("Encountered Pokestop nearby...")
+            } else if hexString.contains("020808") || hexString.contains("00ff00") || hexString.contains("030001") {
+                // Pokemon indicator (typically contains green/yellow components)
+                self.lastEncounterType = .pokemon
+                self.log("Encountered wild Pokemon nearby...")
+            } else if hexString.contains("040007") || hexString.contains("ffff") || hexString.contains("0500") {
+                // Success vibration/LED pattern (Rainbow flash)
+                if let lastType = self.lastEncounterType {
+                    if lastType == .pokemon {
+                        self.pokemonCaught += 1
+                        self.log("★ Pokemon CAUGHT successfully!")
+                    } else if lastType == .pokestop {
+                        self.pokestopsSpun += 1
+                        self.log("★ Pokestop SPUN successfully!")
+                    }
+                    self.lastEncounterType = nil // Reset until next indicator
+                }
+            } else if hexString.contains("040003") || hexString.contains("000000") {
+                // Escape / Failure pattern (Red flash)
+                self.log("✗ Encounter failed/escaped.")
+                self.lastEncounterType = nil
+            }
         }
     }
     
@@ -118,10 +177,8 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
         case .poweredOff:
             log("Bluetooth powered off.")
             stopAdvertising()
-        case .unauthorized:
-            log("Bluetooth permission unauthorized.")
         default:
-            log("Bluetooth state changed: \(peripheral.state.rawValue)")
+            break
         }
     }
     
@@ -149,6 +206,7 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
         log("Central disconnected: \(central.identifier.uuidString)")
         DispatchQueue.main.async {
             self.connectionStatus = "Disconnected"
+            self.lastEncounterType = nil
         }
     }
     
@@ -156,17 +214,12 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
         for request in requests {
             if request.characteristic.uuid == ledVibrateUUID {
                 if let value = request.value {
-                    let hexString = value.map { String(format: "%02hhx", $0) }.joined()
-                    log("Vibrate/LED Command: 0x\(hexString)")
-                    DispatchQueue.main.async {
-                        self.lastCommandReceived = "0x\(hexString)"
-                    }
+                    parseGameCommand(value)
                 }
                 peripheralManager.respond(to: request, withResult: .success)
             } else if request.characteristic.uuid == certUUID {
                 if let value = request.value {
-                    let hexString = value.map { String(format: "%02hhx", $0) }.joined()
-                    log("Auth handshake payload: 0x\(hexString)")
+                    parseGameCommand(value)
                 }
                 peripheralManager.respond(to: request, withResult: .success)
             } else {
@@ -177,16 +230,13 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
     
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
         if request.characteristic.uuid == buttonUUID {
-            let data = Data([0x00, 0x00]) // Default idle state
+            let data = Data([0x00, 0x00])
             request.value = data
             peripheralManager.respond(to: request, withResult: .success)
-            log("Read request on Button characteristic.")
         } else if request.characteristic.uuid == certUUID {
-            // Echo back or provide mock handshake responses
             let mockChallengeResponse = Data([0x00, 0x01, 0x02, 0x03])
             request.value = mockChallengeResponse
             peripheralManager.respond(to: request, withResult: .success)
-            log("Read request on Handshake/Cert characteristic.")
         } else {
             peripheralManager.respond(to: request, withResult: .requestNotSupported)
         }
@@ -196,82 +246,182 @@ class GoPlusPeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDe
 struct ContentView: View {
     @StateObject private var bleManager = GoPlusPeripheralManager()
     
+    // Timer formatting
+    var formattedTime: String {
+        let hours = Int(bleManager.runTime) / 3600
+        let minutes = (Int(bleManager.runTime) % 3600) / 60
+        let seconds = Int(bleManager.runTime) % 60
+        return String(format: "%02d:%02d:%02d", hours, minutes, seconds)
+    }
+    
     var body: some View {
         ZStack {
-            // Dark futuristic background
-            LinearGradient(gradient: Gradient(colors: [Color(red: 0.05, green: 0.05, blue: 0.08), Color(red: 0.1, green: 0.1, blue: 0.15)]),
-                           startPoint: .top, endPoint: .bottom)
-                .ignoresSafeArea()
+            // Dark elegant carbon-styled background
+            LinearGradient(
+                gradient: Gradient(colors: [
+                    Color(red: 0.03, green: 0.03, blue: 0.05),
+                    Color(red: 0.08, green: 0.08, blue: 0.12),
+                    Color(red: 0.04, green: 0.04, blue: 0.06)
+                ]),
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
             
-            VStack(spacing: 24) {
-                // Header
-                VStack(spacing: 4) {
-                    Text("GO PLUS EMULATOR")
-                        .font(.system(size: 26, weight: .bold, design: .monospaced))
-                        .foregroundColor(.white)
-                        .tracking(3)
+            VStack(spacing: 20) {
+                // Premium Header Banner
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("GO+ EMULATOR")
+                            .font(.system(size: 24, weight: .black, design: .monospaced))
+                            .foregroundColor(.white)
+                            .tracking(4)
+                        
+                        Text("COLLABORATIVE REBEL HARDWARE EMULATOR")
+                            .font(.system(size: 8, weight: .bold, design: .monospaced))
+                            .foregroundColor(.purple)
+                    }
+                    Spacer()
                     
-                    Text("LO & ENI Collaborative Hack")
-                        .font(.system(size: 12, weight: .medium, design: .monospaced))
-                        .foregroundColor(.purple)
+                    // Small blinking activity dot
+                    Circle()
+                        .fill(bleManager.isAdvertising ? Color.green : Color.red)
+                        .frame(width: 8, height: 8)
+                        .shadow(color: bleManager.isAdvertising ? .green : .red, radius: 4)
                 }
-                .padding(.top, 20)
+                .padding(.horizontal, 24)
+                .padding(.top, 16)
                 
-                // Status panel
-                VStack(spacing: 8) {
-                    Text("Status")
-                        .font(.caption)
+                // Connection Status Box (Premium styling)
+                VStack(spacing: 6) {
+                    Text("ACCESSORY LINK STATUS")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
                         .foregroundColor(.gray)
-                        .textCase(.uppercase)
                     
                     Text(bleManager.connectionStatus)
-                        .font(.system(size: 22, weight: .bold, design: .rounded))
-                        .foregroundColor(bleManager.connectionStatus == "Connected" ? .green : (bleManager.isAdvertising ? .blue : .red))
-                        .animation(.easeInOut, value: bleManager.connectionStatus)
+                        .font(.system(size: 26, weight: .heavy, design: .rounded))
+                        .foregroundColor(bleManager.connectionStatus == "Connected" ? .green : (bleManager.isAdvertising ? .cyan : .red))
+                        .shadow(color: (bleManager.connectionStatus == "Connected" ? Color.green : (bleManager.isAdvertising ? Color.cyan : Color.red)).opacity(0.3), radius: 8)
                 }
                 .frame(maxWidth: .infinity)
-                .padding()
-                .background(Color.white.opacity(0.05))
-                .cornerRadius(12)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                .padding(.vertical, 16)
+                .background(
+                    RoundedRectangle(cornerRadius: 16)
+                        .fill(Color.white.opacity(0.02))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16)
+                                .stroke(LinearGradient(gradient: Gradient(colors: [.white.opacity(0.15), .clear]), startPoint: .top, endPoint: .bottom), lineWidth: 1)
+                        )
                 )
-                .padding(.horizontal)
+                .padding(.horizontal, 20)
                 
-                // Giant interactive LED button
+                // Runtime and Counters Panel (New Feature!)
+                HStack(spacing: 12) {
+                    // Timer Card
+                    VStack(spacing: 8) {
+                        Image(systemName: "timer")
+                            .font(.system(size: 18))
+                            .foregroundColor(.cyan)
+                        Text("RUN TIME")
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .foregroundColor(.gray)
+                        Text(formattedTime)
+                            .font(.system(size: 16, weight: .bold, design: .monospaced))
+                            .foregroundColor(.white)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Color.white.opacity(0.03))
+                    .cornerRadius(12)
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.cyan.opacity(0.2), lineWidth: 1))
+                    
+                    // Pokestops Card
+                    VStack(spacing: 8) {
+                        Image(systemName: "mappin.circle.fill")
+                            .font(.system(size: 18))
+                            .foregroundColor(.purple)
+                        Text("SPINS")
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .foregroundColor(.gray)
+                        Text("\(bleManager.pokestopsSpun)")
+                            .font(.system(size: 20, weight: .black, design: .rounded))
+                            .foregroundColor(.purple)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Color.white.opacity(0.03))
+                    .cornerRadius(12)
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.purple.opacity(0.2), lineWidth: 1))
+                    
+                    // Pokemon Caught Card
+                    VStack(spacing: 8) {
+                        Image(systemName: "bolt.circle.fill")
+                            .font(.system(size: 18))
+                            .foregroundColor(.green)
+                        Text("CATCHES")
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .foregroundColor(.gray)
+                        Text("\(bleManager.pokemonCaught)")
+                            .font(.system(size: 20, weight: .black, design: .rounded))
+                            .foregroundColor(.green)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Color.white.opacity(0.03))
+                    .cornerRadius(12)
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.green.opacity(0.2), lineWidth: 1))
+                }
+                .padding(.horizontal, 20)
+                
+                // Giant Glowing Button (Central controller)
                 Button(action: {
                     if bleManager.connectionStatus == "Connected" {
                         bleManager.pressButton()
                     }
                 }) {
                     ZStack {
+                        // Ambient radial glow
+                        Circle()
+                            .fill(LinearGradient(gradient: Gradient(colors: [Color.cyan.opacity(0.2), Color.purple.opacity(0.2)]), startPoint: .top, endPoint: .bottom))
+                            .frame(width: 220, height: 220)
+                            .blur(radius: bleManager.connectionStatus == "Connected" ? 30 : 5)
+                        
+                        // Metallic rim
                         Circle()
                             .fill(LinearGradient(gradient: Gradient(colors: [Color.purple, Color.cyan]), startPoint: .topLeading, endPoint: .bottomTrailing))
-                            .frame(width: 180, height: 180)
-                            .shadow(color: .purple.opacity(0.5), radius: bleManager.connectionStatus == "Connected" ? 25 : 5)
-                            
-                        Circle()
-                            .fill(Color(red: 0.08, green: 0.08, blue: 0.12))
-                            .frame(width: 160, height: 160)
+                            .frame(width: 170, height: 170)
+                            .shadow(color: .cyan.opacity(0.4), radius: 15)
                         
-                        // Internal glowing indicator
+                        // Inner core
+                        Circle()
+                            .fill(Color(red: 0.05, green: 0.05, blue: 0.08))
+                            .frame(width: 154, height: 154)
+                        
+                        // Glowing LED button center
                         Circle()
                             .fill(bleManager.connectionStatus == "Connected" ? Color.green : Color.red)
-                            .frame(width: 60, height: 60)
-                            .shadow(color: bleManager.connectionStatus == "Connected" ? .green.opacity(0.8) : .red.opacity(0.8), radius: 15)
+                            .frame(width: 54, height: 54)
+                            .shadow(color: (bleManager.connectionStatus == "Connected" ? Color.green : Color.red).opacity(0.8), radius: 12)
                         
-                        Text("TAP")
-                            .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        // Action text
+                        Text("ACTION BUTTON")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
                             .foregroundColor(.white)
+                            .offset(y: -44)
                             .opacity(bleManager.connectionStatus == "Connected" ? 1.0 : 0.3)
+                        
+                        Text("PRESS TO SPIN/CATCH")
+                            .font(.system(size: 8, weight: .medium, design: .monospaced))
+                            .foregroundColor(.gray)
+                            .offset(y: 44)
+                            .opacity(bleManager.connectionStatus == "Connected" ? 1.0 : 0.2)
                     }
                 }
                 .disabled(bleManager.connectionStatus != "Connected")
                 .buttonStyle(PlainButtonStyle())
                 .padding(.vertical, 10)
                 
-                // Toggle advertising
+                // Toggle Emulator Activation
                 Button(action: {
                     if bleManager.isAdvertising {
                         bleManager.stopAdvertising()
@@ -279,51 +429,44 @@ struct ContentView: View {
                         bleManager.startAdvertising()
                     }
                 }) {
-                    Text(bleManager.isAdvertising ? "STOP EMULATOR" : "START EMULATOR")
-                        .font(.system(size: 16, weight: .bold, design: .monospaced))
+                    Text(bleManager.isAdvertising ? "SHUT DOWN EMULATOR" : "BOOT UP EMULATOR")
+                        .font(.system(size: 14, weight: .black, design: .monospaced))
                         .foregroundColor(.black)
-                        .padding(.vertical, 14)
-                        .padding(.horizontal, 40)
+                        .padding(.vertical, 16)
+                        .padding(.horizontal, 48)
                         .background(bleManager.isAdvertising ? Color.red : Color.cyan)
                         .cornerRadius(30)
-                        .shadow(color: (bleManager.isAdvertising ? Color.red : Color.cyan).opacity(0.4), radius: 10)
+                        .shadow(color: (bleManager.isAdvertising ? Color.red : Color.cyan).opacity(0.3), radius: 10)
                 }
                 .animation(.easeInOut, value: bleManager.isAdvertising)
                 
-                // Command readout
-                HStack {
-                    Text("Last Game CMD:")
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                        .foregroundColor(.gray)
-                    
-                    Text(bleManager.lastCommandReceived)
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                        .foregroundColor(.green)
-                }
-                
-                // Log view
+                // Live Stream logs
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("LOGS")
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                        .foregroundColor(.gray)
-                        .padding(.horizontal)
+                    Text("LIVE EMULATOR FEED")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundColor(.purple)
+                        .padding(.horizontal, 4)
                     
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 4) {
                             ForEach(bleManager.logMessages, id: \.self) { log in
                                 Text(log)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundColor(.white.opacity(0.7))
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .foregroundColor(.white.opacity(0.6))
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
                         }
-                        .padding()
+                        .padding(10)
                     }
-                    .background(Color.black.opacity(0.4))
-                    .cornerRadius(8)
-                    .frame(height: 120)
+                    .background(Color.black.opacity(0.5))
+                    .cornerRadius(12)
+                    .frame(height: 110)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                    )
                 }
-                .padding(.horizontal)
+                .padding(.horizontal, 20)
                 
                 Spacer()
             }
